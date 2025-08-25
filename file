@@ -1,0 +1,367 @@
+"""
+Heavy-Metal-Prediction-in-Groundwater (Synthetic Demo)
+------------------------------------------------------
+Generates a synthetic groundwater water‑quality dataset (>100 rows),
+builds a predictive model for heavy metal concentration (default: Lead/Pb),
+evaluates it, and exports artifacts (CSV, trained model, and importance plots).
+
+• Target: Pb_ppb (micrograms per liter ≡ parts per billion)
+• Features include: pH, EC, TDS, hardness, nutrients, depth, land use, etc.
+• Model: RandomForestRegressor inside an sklearn Pipeline with preprocessing.
+
+Usage
+-----
+python heavy_metal_prediction.py --n 1000 --target Pb_ppb --seed 42
+
+Artifacts written to ./artifacts/
+
+Requirements (minimal)
+-----------------------
+- numpy, pandas, scikit-learn, matplotlib, joblib
+(Optional)
+- shap (for SHAP plots; script will skip if unavailable)
+"""
+
+from __future__ import annotations
+import argparse
+import os
+import warnings
+from dataclasses import dataclass
+from typing import Tuple, List
+
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.inspection import permutation_importance
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# --------------------------- Synthetic Data Generation --------------------------- #
+
+def _bounded_normal(mean: float, sd: float, low: float, high: float, n: int, rng: np.random.Generator) -> np.ndarray:
+    """Draw from a normal distribution and clip to [low, high]."""
+    vals = rng.normal(mean, sd, n)
+    return np.clip(vals, low, high)
+
+@dataclass
+class SyntheticConfig:
+    n: int = 1000
+    seed: int = 42
+
+
+def generate_synthetic_groundwater(cfg: SyntheticConfig) -> pd.DataFrame:
+    rng = np.random.default_rng(cfg.seed)
+    n = cfg.n
+
+    # Core hydrochemical parameters (approximate ranges for illustration)
+    pH = _bounded_normal(mean=7.1, sd=0.6, low=5.5, high=8.8, n=n, rng=rng)
+    EC_uScm = rng.gamma(shape=3.0, scale=250.0, size=n)  # skewed, ~200–3000
+    EC_uScm = np.clip(EC_uScm, 100, 4000)
+    TDS_mgL = EC_uScm * rng.normal(0.65, 0.08, n)  # correlated with EC
+    TDS_mgL = np.clip(TDS_mgL, 80, 3000)
+    Hardness_mgL = rng.normal(200, 80, n)
+    Hardness_mgL = np.clip(Hardness_mgL, 40, 600)
+
+    Nitrate_mgL = np.clip(rng.gamma(2.0, 6.0, n), 0, 80)
+    Sulfate_mgL = np.clip(rng.gamma(2.0, 30.0, n), 0, 500)
+    Chloride_mgL = np.clip(rng.gamma(2.5, 35.0, n), 5, 700)
+    DO_mgL = np.clip(rng.normal(5.5, 1.8, n), 0.5, 12)
+
+    Depth_m = np.clip(rng.normal(50, 25, n), 2, 180)
+    Distance_to_industry_km = np.clip(rng.exponential(5.0, n), 0.0, 30.0)
+    Temperature_C = np.clip(rng.normal(27.0, 3.0, n), 15, 40)
+    Rainfall_mm = np.clip(rng.gamma(2.0, 40.0, n), 0, 400)
+
+    # Land use categories with probabilities
+    landuse_categories = np.array(["agric", "urban", "industrial"])
+    landuse_probs = np.array([0.45, 0.35, 0.20])
+    Landuse = rng.choice(landuse_categories, size=n, p=landuse_probs)
+
+    # Construct synthetic heavy metal concentrations (ppb)
+    # Pb increases with lower pH, higher EC/TDS, shallower wells, proximity to industry, and nitrate
+    landuse_weight = {
+        "agric": 1.0,
+        "urban": 1.4,
+        "industrial": 2.0,
+    }
+    lu_w = np.vectorize(landuse_weight.get)(Landuse)
+
+    # Base signal with nonlinear pieces and noise
+    inv_depth = 1.0 / (Depth_m + 5.0)
+    inv_dist = 1.0 / (Distance_to_industry_km + 0.5)
+
+    # Lead (Pb) model (in ppb)
+    Pb_ppb = (
+        4.0
+        + 8.0 * np.maximum(0, 7.0 - pH)  # acidity effect
+        + 0.006 * EC_uScm
+        + 0.004 * TDS_mgL
+        + 20.0 * inv_depth
+        + 25.0 * inv_dist
+        + 0.6 * Nitrate_mgL
+        + 0.03 * Sulfate_mgL
+        + 5.0 * (lu_w - 1.0)
+        + rng.normal(0, 6.0, n)  # noise
+    )
+    Pb_ppb = np.clip(Pb_ppb, 0, None)
+
+    # Arsenic (As) model (ppb) — correlated but different drivers
+    As_ppb = (
+        3.0
+        + 0.004 * EC_uScm
+        + 0.002 * TDS_mgL
+        + 18.0 * inv_depth
+        + 0.4 * Sulfate_mgL
+        + 0.3 * Chloride_mgL
+        + 0.4 * Nitrate_mgL
+        + 4.0 * (lu_w - 1.0)
+        + rng.normal(0, 5.0, n)
+    )
+    As_ppb = np.clip(As_ppb, 0, None)
+
+    df = pd.DataFrame(
+        {
+            "pH": pH,
+            "EC_uScm": EC_uScm,
+            "TDS_mgL": TDS_mgL,
+            "Hardness_mgL": Hardness_mgL,
+            "Nitrate_mgL": Nitrate_mgL,
+            "Sulfate_mgL": Sulfate_mgL,
+            "Chloride_mgL": Chloride_mgL,
+            "DO_mgL": DO_mgL,
+            "Depth_m": Depth_m,
+            "Distance_to_industry_km": Distance_to_industry_km,
+            "Temperature_C": Temperature_C,
+            "Rainfall_mm": Rainfall_mm,
+            "Landuse": Landuse,
+            "Pb_ppb": Pb_ppb,
+            "As_ppb": As_ppb,
+        }
+    )
+
+    # WHO guideline references (for context; not used directly in regression)
+    df["Pb_exceeds_WHO_10ppb"] = (df["Pb_ppb"] > 10).astype(int)
+    df["As_exceeds_WHO_10ppb"] = (df["As_ppb"] > 10).astype(int)
+
+    return df
+
+# --------------------------- Modeling Utilities --------------------------- #
+
+def build_pipeline(feature_cols: List[str], categorical_cols: List[str]) -> Pipeline:
+    numeric_cols = [c for c in feature_cols if c not in categorical_cols]
+
+    preproc = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), numeric_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
+        ]
+    )
+
+    model = RandomForestRegressor(
+        n_estimators=400,
+        max_depth=None,
+        min_samples_leaf=2,
+        n_jobs=-1,
+        random_state=1337,
+    )
+
+    pipe = Pipeline([
+        ("pre", preproc),
+        ("rf", model),
+    ])
+    return pipe
+
+
+def evaluate_model(model: Pipeline, X_test: pd.DataFrame, y_test: pd.Series) -> dict:
+    preds = model.predict(X_test)
+    r2 = r2_score(y_test, preds)
+    rmse = mean_squared_error(y_test, preds, squared=False)
+    mae = mean_absolute_error(y_test, preds)
+    return {"r2": r2, "rmse": rmse, "mae": mae}
+
+# --------------------------- Plotting Helpers --------------------------- #
+
+def plot_permutation_importance(model: Pipeline, X: pd.DataFrame, y: pd.Series, out_path: str, top_k: int = 15) -> None:
+    """Compute permutation importance on provided data and save a barplot."""
+    result = permutation_importance(model, X, y, n_repeats=10, random_state=123, n_jobs=-1)
+    importances = pd.DataFrame({
+        "feature": X.columns,
+        "importance_mean": result.importances_mean,
+        "importance_std": result.importances_std,
+    }).sort_values("importance_mean", ascending=False)
+
+    plt.figure(figsize=(8, 6))
+    subset = importances.head(top_k)
+    plt.barh(subset["feature"][::-1], subset["importance_mean"][::-1])
+    plt.xlabel("Permutation Importance (mean ΔR²)")
+    plt.ylabel("Feature")
+    plt.title("Top Feature Importances (Permutation)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+    # Save CSV for transparency
+    csv_path = os.path.splitext(out_path)[0] + ".csv"
+    subset.to_csv(csv_path, index=False)
+
+
+def plot_parity(y_true: np.ndarray, y_pred: np.ndarray, out_path: str, title: str = "Predicted vs Observed") -> None:
+    plt.figure(figsize=(6, 6))
+    plt.scatter(y_true, y_pred, alpha=0.5)
+    lims = [0, max(np.max(y_true), np.max(y_pred)) * 1.05]
+    plt.plot(lims, lims, linestyle="--")
+    plt.xlim(lims)
+    plt.ylim(lims)
+    plt.xlabel("Observed (ppb)")
+    plt.ylabel("Predicted (ppb)")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def maybe_plot_shap(pipe: Pipeline, X_sample: pd.DataFrame, out_path_prefix: str) -> bool:
+    """Create SHAP summary plots if shap is installed; return True on success."""
+    try:
+        import shap  # type: ignore
+    except Exception:
+        return False
+
+    # Extract trained RF estimator and preprocessor
+    pre = pipe.named_steps["pre"]
+    rf: RandomForestRegressor = pipe.named_steps["rf"]
+
+    X_enc = pre.transform(X_sample)
+    # shap can work directly with tree models on transformed data
+    try:
+        explainer = shap.TreeExplainer(rf)
+        shap_values = explainer.shap_values(X_enc)
+
+        # Summary bar plot
+        shap.summary_plot(shap_values, X_enc, show=False)
+        plt.tight_layout()
+        plt.savefig(out_path_prefix + "_shap_summary.png", dpi=160)
+        plt.close()
+
+        # Beeswarm
+        shap.summary_plot(shap_values, X_enc, plot_type="dot", show=False)
+        plt.tight_layout()
+        plt.savefig(out_path_prefix + "_shap_beeswarm.png", dpi=160)
+        plt.close()
+        return True
+    except Exception:
+        return False
+
+# --------------------------- Main --------------------------- #
+
+def main():
+    parser = argparse.ArgumentParser(description="Synthetic heavy-metal prediction in groundwater")
+    parser.add_argument("--n", type=int, default=1000, help=">= 101 rows (default: 1000)")
+    parser.add_argument("--target", type=str, default="Pb_ppb", choices=["Pb_ppb", "As_ppb"], help="Target metal concentration to model")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    args = parser.parse_args()
+
+    if args.n < 101:
+        raise SystemExit("Please use --n >= 101 (requirement: >100 points)")
+
+    cfg = SyntheticConfig(n=args.n, seed=args.seed)
+    df = generate_synthetic_groundwater(cfg)
+
+    # Select features and target
+    feature_cols = [
+        "pH", "EC_uScm", "TDS_mgL", "Hardness_mgL", "Nitrate_mgL", "Sulfate_mgL",
+        "Chloride_mgL", "DO_mgL", "Depth_m", "Distance_to_industry_km", "Temperature_C",
+        "Rainfall_mm", "Landuse"
+    ]
+    categorical_cols = ["Landuse"]
+    target_col = args.target
+
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=cfg.seed
+    )
+
+    pipe = build_pipeline(feature_cols, categorical_cols)
+
+    # Fit and quick CV
+    pipe.fit(X_train, y_train)
+    cv_scores = cross_val_score(pipe, X_train, y_train, cv=5, scoring="r2", n_jobs=-1)
+
+    # Evaluate
+    metrics = evaluate_model(pipe, X_test, y_test)
+
+    # Prepare artifacts directory
+    os.makedirs("artifacts", exist_ok=True)
+
+    # Export dataset
+    df.to_csv("artifacts/synthetic_groundwater.csv", index=False)
+
+    # Save model
+    joblib.dump(pipe, f"artifacts/model_{target_col}.joblib")
+
+    # Parity plot
+    y_pred = pipe.predict(X_test)
+    plot_parity(y_test.values, y_pred, f"artifacts/{target_col}_parity.png", title=f"{target_col}: Predicted vs Observed")
+
+    # Permutation importance on test set
+    # Need the transformed column names from preprocessor
+    pre = pipe.named_steps["pre"]
+    ohe: OneHotEncoder = pre.named_transformers_["cat"]
+    num_cols = [c for c in feature_cols if c not in categorical_cols]
+    cat_cols = list(ohe.get_feature_names_out(categorical_cols))
+    colnames = num_cols + cat_cols
+
+    # Build a DataFrame with encoded columns for permutation_importance labels
+    # (Permutation importance accepts X as DataFrame to keep column names)
+    X_test_enc = pd.DataFrame(pre.transform(X_test).toarray() if hasattr(pre.transform(X_test), 'toarray') else pre.transform(X_test), columns=colnames)
+
+    # Compute and plot
+    result = permutation_importance(pipe, X_test, y_test, n_repeats=10, random_state=123, n_jobs=-1)
+    imp_df = pd.DataFrame({
+        "feature": colnames,
+        "importance_mean": result.importances_mean,
+        "importance_std": result.importances_std,
+    }).sort_values("importance_mean", ascending=False)
+
+    # Plot top-15
+    plt.figure(figsize=(8, 6))
+    subset = imp_df.head(15)
+    plt.barh(subset["feature"][::-1], subset["importance_mean"][::-1])
+    plt.xlabel("Permutation Importance (mean ΔR²)")
+    plt.ylabel("Feature")
+    plt.title(f"{target_col} — Top Feature Importances")
+    plt.tight_layout()
+    plt.savefig(f"artifacts/{target_col}_perm_importance.png", dpi=160)
+    plt.close()
+
+    # Optional SHAP plots (best-effort)
+    _ = maybe_plot_shap(pipe, X_test.sample(min(400, len(X_test)), random_state=7), f"artifacts/{target_col}")
+
+    # Print a concise report to stdout
+    print("\n=== Synthetic Heavy-Metal Prediction Report ===")
+    print(f"Rows: {len(df):,}   Target: {target_col}")
+    print("Train R² (5-fold CV):  mean={:.3f}  std={:.3f}".format(cv_scores.mean(), cv_scores.std()))
+    print("Test Metrics:")
+    print("  R²   = {:.3f}".format(metrics["r2"]))
+    print("  RMSE = {:.3f} ppb".format(metrics["rmse"]))
+    print("  MAE  = {:.3f} ppb".format(metrics["mae"]))
+    print("Artifacts saved under ./artifacts :")
+    print("  - synthetic_groundwater.csv")
+    print(f"  - model_{target_col}.joblib")
+    print(f"  - {target_col}_parity.png")
+    print(f"  - {target_col}_perm_importance.png (+ CSV)")
+    print("  - Optional: SHAP plots if 'shap' was available")
+
+
+if __name__ == "__main__":
+    main()
